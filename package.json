@@ -1,0 +1,20 @@
+{
+  "name": "ollama",
+  "version": "1.0.0",
+  "description": "Run an AI-powered Discord bot from the comfort of your laptop.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.2.3",
+    "ioredis": "^5.9.2",
+    "ollama": "^0.6.3",
+    "seyfert": "^4.0.0"
+  }
+}
