@@ -70,6 +70,7 @@ class Discollama {
     this.model = model;
 
     this.lastHeartbeat = Date.now();
+    this.isDiscordReady = false;
     this.reconnectAttempts = 0;
     this.shuttingDown = false;
 
@@ -77,14 +78,23 @@ class Discollama {
     this.client.on("clientReady", this.onReady.bind(this));
     this.client.on("messageCreate", this.onMessage.bind(this));
 
+    this.client.on("shardResume", () => {
+      this.lastHeartbeat = Date.now();
+    });
+
     this.client.on("shardDisconnect", () => {
+      this.isDiscordReady = false;
       this.scheduleReconnect();
     });
   }
 
   async onReady() {
+    this.isDiscordReady = true;
+    this.lastHeartbeat = Date.now();
+    this.reconnectAttempts = 0;
+
     const activity = {
-      name: "Discollama",
+      name: "Ollama",
       state: "Ask me anything!",
       type: ActivityType.Custom
     };
@@ -114,8 +124,6 @@ class Discollama {
 
     // don't respond to messages that don't mention us
     if (!message.mentions.has(this.client.user)) return;
-
-    this.lastHeartbeat = Date.now();
 
     let content = message.content
       .replace(`<@${this.client.user.id}>`, "")
@@ -155,7 +163,10 @@ class Discollama {
     }
 
     await r.write("");
-    await this.save(r.channel.id, message.id, lastPart.context);
+
+    if (lastPart?.context) {
+      await this.save(r.channel.id, message.id, lastPart.context);
+    }
 
     if (r.channel.isThread()) {
       await this.touchThread(r.channel.id);
@@ -187,79 +198,14 @@ class Discollama {
     }
   }
 
-  async save(channelId, messageId, ctx) {
-    this.redis.set(
-      `discollama:channel:${channelId}`,
-      messageId,
-      "EX",
-      60 * 60 * 24 * 7
-    );
-
-    this.redis.set(
-      `discollama:message:${messageId}`,
-      JSON.stringify(ctx),
-      "EX",
-      60 * 60 * 24 * 7
-    );
-  }
-
-  async load({ channelId, messageId }) {
-    if (channelId) {
-      messageId = await this.redis.get(
-        `discollama:channel:${channelId}`
-      );
-    }
-
-    const ctx = await this.redis.get(
-      `discollama:message:${messageId}`
-    );
-
-    return ctx ? JSON.parse(ctx) : [];
-  }
-
-  async warmUpModel() {
-    try {
-      this.ollama.generate({
-        model: this.model,
-        prompt: "Hello",
-        keep_alive: -1
-      });
-    } catch {}
-  }
-
-  async touchThread(threadId) {
-    await this.redis.set(
-      `discollama:thread:${threadId}`,
-      Date.now(),
-      "EX",
-      THREAD_IDLE_TTL
-    );
-  }
-
-  startIdleThreadWatcher() {
-    setInterval(async () => {
-      const keys = await this.redis.keys("discollama:thread:*");
-
-      for (const key of keys) {
-        const threadId = key.split(":")[2];
-        const ts = await this.redis.get(key);
-
-        if (!ts) {
-          try {
-            const thread = await this.client.channels.fetch(threadId);
-            if (thread?.isThread()) {
-              await thread.setArchived(true);
-            }
-            await this.redis.del(key);
-          } catch {}
-        }
-      }
-    }, 60_000);
-  }
-
   startHeartbeatWatchdog() {
     setInterval(() => {
-      if (Date.now() - this.lastHeartbeat > HEARTBEAT_INTERVAL * 2) {
+      if (!this.isDiscordReady) return;
+
+      const diff = Date.now() - this.lastHeartbeat;
+
+      // restart only if Discord is truly dead (10+ minutes)
+      if (diff > 10 * 60 * 1000) {
         this.selfHeal();
       }
     }, HEARTBEAT_INTERVAL);
@@ -278,6 +224,11 @@ class Discollama {
   }
 
   selfHeal() {
+    if (process.env.SELF_HEAL !== "true") {
+      console.warn("Self-heal disabled, skipping restart");
+      return;
+    }
+
     if (this.shuttingDown) return;
     this.shuttingDown = true;
 
@@ -288,12 +239,90 @@ class Discollama {
     setTimeout(() => process.exit(1), 1000);
   }
 
-  run(token) {
+  async save(channelId, messageId, ctx) {
     try {
-      this.client.login(token);
+      await this.redis.set(
+        `discollama:channel:${channelId}`,
+        messageId,
+        "EX",
+        60 * 60 * 24 * 7
+      );
+
+      await this.redis.set(
+        `discollama:message:${messageId}`,
+        JSON.stringify(ctx),
+        "EX",
+        60 * 60 * 24 * 7
+      );
+    } catch {}
+  }
+
+  async load({ channelId, messageId }) {
+    try {
+      if (channelId) {
+        messageId = await this.redis.get(
+          `discollama:channel:${channelId}`
+        );
+      }
+
+      if (!messageId) return [];
+
+      const ctx = await this.redis.get(
+        `discollama:message:${messageId}`
+      );
+
+      return ctx ? JSON.parse(ctx) : [];
     } catch {
-      this.redis.quit();
+      return [];
     }
+  }
+
+  async warmUpModel() {
+    try {
+      this.ollama.generate({
+        model: this.model,
+        prompt: "Hello",
+        keep_alive: -1
+      });
+    } catch {}
+  }
+
+  async touchThread(threadId) {
+    try {
+      await this.redis.set(
+        `discollama:thread:${threadId}`,
+        Date.now(),
+        "EX",
+        THREAD_IDLE_TTL
+      );
+    } catch {}
+  }
+
+  startIdleThreadWatcher() {
+    setInterval(async () => {
+      let keys = [];
+      try {
+        keys = await this.redis.keys("discollama:thread:*");
+      } catch {
+        return;
+      }
+
+      for (const key of keys) {
+        const threadId = key.split(":")[2];
+
+        try {
+          const thread = await this.client.channels.fetch(threadId);
+          if (thread?.isThread()) {
+            await thread.setArchived(true);
+          }
+          await this.redis.del(key);
+        } catch {}
+      }
+    }, 60_000);
+  }
+
+  run(token) {
+    this.client.login(token);
   }
 }
 
@@ -306,13 +335,17 @@ const client = new Client({
   rest: { timeout: 15_000 }
 });
 
-const redis = new Redis(
-  process.env.REDIS_PORT || 6379,
-  process.env.REDIS_HOST || "127.0.0.1"
-);
+const redis = new Redis({
+  host: process.env.REDIS_HOST || "127.0.0.1",
+  port: process.env.REDIS_PORT || 6379,
+  retryStrategy: times => Math.min(times * 1000, 10_000),
+  reconnectOnError: () => true,
+  maxRetriesPerRequest: null,
+  enableOfflineQueue: false
+});
 
 const ollama = new Ollama({
-  host: "http://127.0.0.1:11434"
+  host: process.env.OLLAMA_HOST || "http://127.0.0.1:11434"
 });
 
 new Discollama({
