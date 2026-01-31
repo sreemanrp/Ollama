@@ -37,14 +37,16 @@ or by replying to a previous response to continue an ongoing conversation.
 
 Each conversation is handled inside a dedicated thread created by the bot.
 
----
-
-## ⚠️ Warning
-
-This repository is a **modified version** of  
-https://github.com/mxyng/discollama
-
-It has been updated, extended, and reworked to support newer features, improved stability,
-and long-running deployments.  
-The goal of this project is to keep it **open-source** and actively maintained for the
+> [!WARNING]
+>
+> This repository is a **modified version** of [discollama](https://github.com/mxyng/discollama)
+> 
+> It has been updated, extended, and reworked to support newer features, improved stability, and long-running deployments.  
+> The goal of this project is to keep it **open-source** and actively maintained for the
 **Ollama community**.
+
+## Credits
+
+- [@mxyng](https://github.com/mxyng) — Original author of the base project
+
+- [@Ollama](https://github.com/ollama) — Open-source LLM runtime and tooling
