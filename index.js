@@ -20,11 +20,6 @@ process.on("uncaughtException", err => {
   console.error(err);
 });
 
-const THREAD_IDLE_TTL = 10 * 60;
-const HEARTBEAT_INTERVAL = 30_000;
-const RECONNECT_BASE_DELAY = 2_000;
-const RECONNECT_MAX_DELAY = 60_000;
-
 class Response {
   constructor(message) {
     this.message = message;
@@ -35,6 +30,7 @@ class Response {
   }
 
   async write(s, end = "") {
+    // reset buffer if message exceeds Discord limit
     if ((this.buffer + s + end).length > 2000) {
       this.r = null;
       this.buffer = "";
@@ -46,11 +42,13 @@ class Response {
     if (!value) return;
 
     if (this.r) {
+      // edit existing message
       await this.r.edit(value + end);
       return;
     }
 
     if (this.channel.type === ChannelType.GuildText) {
+      // create thread on first response
       this.channel = await this.channel.threads.create({
         name: "Ollama Says",
         startMessage: this.message,
@@ -63,36 +61,21 @@ class Response {
 }
 
 class Discollama {
-  constructor({ client, ollama, redis, model }) {
-    this.ollama = ollama;
+  constructor({ client, ollama, redis }) {
     this.client = client;
+    this.ollama = ollama;
     this.redis = redis;
-    this.model = model;
 
-    this.lastHeartbeat = Date.now();
-    this.isDiscordReady = false;
-    this.reconnectAttempts = 0;
-    this.shuttingDown = false;
+    // default models
+    this.chatModel = process.env.OLLAMA_CHAT_MODEL || "qwen3:4b";
+    this.codeModel = process.env.OLLAMA_CODE_MODEL || "qwen2.5-coder";
 
     // register event handlers
     this.client.on("clientReady", this.onReady.bind(this));
     this.client.on("messageCreate", this.onMessage.bind(this));
-
-    this.client.on("shardResume", () => {
-      this.lastHeartbeat = Date.now();
-    });
-
-    this.client.on("shardDisconnect", () => {
-      this.isDiscordReady = false;
-      this.scheduleReconnect();
-    });
   }
 
   async onReady() {
-    this.isDiscordReady = true;
-    this.lastHeartbeat = Date.now();
-    this.reconnectAttempts = 0;
-
     const activity = {
       name: "Ollama",
       state: "Ask me anything!",
@@ -104,9 +87,9 @@ class Discollama {
       status: "online"
     });
 
-    this.warmUpModel();
-    this.startIdleThreadWatcher();
-    this.startHeartbeatWatchdog();
+    // warm up models to reduce first-response latency
+    this.ollama.generate({ model: this.chatModel, prompt: "Hello", keep_alive: -1 }).catch(() => {});
+    this.ollama.generate({ model: this.codeModel, prompt: "Hello", keep_alive: -1 }).catch(() => {});
 
     console.log(
       "Ready! Invite URL:",
@@ -118,12 +101,42 @@ class Discollama {
     );
   }
 
-  async onMessage(message) {
-    // don't respond to ourselves
-    if (message.author.bot) return;
+  // decide which model to use (chat vs coder)
+  pickModel(content) {
+    const codeHints = [
+      "```",
+      "error",
+      "bug",
+      "fix",
+      "function",
+      "class",
+      "const ",
+      "let ",
+      "var ",
+      "import ",
+      "export ",
+      "python",
+      "javascript",
+      "node",
+      "discord.js"
+    ];
 
-    // don't respond to messages that don't mention us
-    if (!message.mentions.has(this.client.user)) return;
+    const lower = content.toLowerCase();
+    return codeHints.some(k => lower.includes(k))
+      ? this.codeModel
+      : this.chatModel;
+  }
+
+  async onMessage(message) {
+    if (message.author.bot) {
+      // don't respond to ourselves
+      return;
+    }
+
+    if (!message.mentions.has(this.client.user)) {
+      // don't respond to messages that don't mention us
+      return;
+    }
 
     let content = message.content
       .replace(`<@${this.client.user.id}>`, "")
@@ -134,11 +147,12 @@ class Discollama {
     const channel = message.channel;
     let context = [];
 
+    // load context from replied message
     if (message.reference?.messageId) {
       context = await this.load({ messageId: message.reference.messageId });
 
       if (!context.length) {
-        const referenceMessage = await message.channel.messages.fetch(
+        const referenceMessage = await channel.messages.fetch(
           message.reference.messageId
         );
 
@@ -150,14 +164,31 @@ class Discollama {
       }
     }
 
+    // fallback to channel context
     if (!context.length) {
       context = await this.load({ channelId: channel.id });
     }
 
+    const model = this.pickModel(content);
+
+    // thinking reaction (Python equivalent)
+    let thinkingActive = true;
+    try {
+      await message.react("🤔");
+      message.channel.sendTyping().catch(() => {});
+    } catch {}
+
     const r = new Response(message);
     let lastPart;
 
-    for await (const part of this.generate(content, context)) {
+    for await (const part of this.generate(model, content, context)) {
+      if (thinkingActive) {
+        thinkingActive = false;
+        try {
+          await message.reactions.resolve("🤔")?.users.remove(this.client.user.id);
+        } catch {}
+      }
+
       await r.write(part.response, "...");
       lastPart = part;
     }
@@ -167,29 +198,30 @@ class Discollama {
     if (lastPart?.context) {
       await this.save(r.channel.id, message.id, lastPart.context);
     }
-
-    if (r.channel.isThread()) {
-      await this.touchThread(r.channel.id);
-    }
   }
 
-  async *generate(content, context) {
+  async *generate(model, content, context) {
     let buffer = "";
     let lastFlush = Date.now();
     let firstToken = true;
 
     const stream = await this.ollama.generate({
-      model: this.model,
+      model,
       prompt: content,
       context,
       keep_alive: -1,
-      stream: true
+      stream: true,
+      options: {
+        temperature: 0.2,
+        top_p: 0.9,
+        num_predict: 512
+      }
     });
 
     for await (const part of stream) {
       buffer += part.response || "";
 
-      if (firstToken || part.done || Date.now() - lastFlush > 300) {
+      if (firstToken || part.done || Date.now() - lastFlush > 200) {
         firstToken = false;
         yield { ...part, response: buffer };
         buffer = "";
@@ -198,127 +230,36 @@ class Discollama {
     }
   }
 
-  startHeartbeatWatchdog() {
-    setInterval(() => {
-      if (!this.isDiscordReady) return;
-
-      const diff = Date.now() - this.lastHeartbeat;
-
-      // restart only if Discord is truly dead (10+ minutes)
-      if (diff > 10 * 60 * 1000) {
-        this.selfHeal();
-      }
-    }, HEARTBEAT_INTERVAL);
-  }
-
-  scheduleReconnect() {
-    if (this.shuttingDown) return;
-
-    this.reconnectAttempts++;
-    const delay = Math.min(
-      RECONNECT_BASE_DELAY * 2 ** this.reconnectAttempts,
-      RECONNECT_MAX_DELAY
+  async save(channelId, messageId, ctx) {
+    this.redis.set(
+      `discollama:channel:${channelId}`,
+      messageId,
+      "EX",
+      60 * 60 * 24 * 7
     );
 
-    setTimeout(() => this.selfHeal(), delay);
-  }
-
-  selfHeal() {
-    if (process.env.SELF_HEAL !== "true") {
-      console.warn("Self-heal disabled, skipping restart");
-      return;
-    }
-
-    if (this.shuttingDown) return;
-    this.shuttingDown = true;
-
-    try {
-      this.redis.quit();
-    } catch {}
-
-    setTimeout(() => process.exit(1), 1000);
-  }
-
-  async save(channelId, messageId, ctx) {
-    try {
-      await this.redis.set(
-        `discollama:channel:${channelId}`,
-        messageId,
-        "EX",
-        60 * 60 * 24 * 7
-      );
-
-      await this.redis.set(
-        `discollama:message:${messageId}`,
-        JSON.stringify(ctx),
-        "EX",
-        60 * 60 * 24 * 7
-      );
-    } catch {}
+    this.redis.set(
+      `discollama:message:${messageId}`,
+      JSON.stringify(ctx),
+      "EX",
+      60 * 60 * 24 * 7
+    );
   }
 
   async load({ channelId, messageId }) {
-    try {
-      if (channelId) {
-        messageId = await this.redis.get(
-          `discollama:channel:${channelId}`
-        );
-      }
-
-      if (!messageId) return [];
-
-      const ctx = await this.redis.get(
-        `discollama:message:${messageId}`
+    if (channelId) {
+      messageId = await this.redis.get(
+        `discollama:channel:${channelId}`
       );
-
-      return ctx ? JSON.parse(ctx) : [];
-    } catch {
-      return [];
     }
-  }
 
-  async warmUpModel() {
-    try {
-      this.ollama.generate({
-        model: this.model,
-        prompt: "Hello",
-        keep_alive: -1
-      });
-    } catch {}
-  }
+    if (!messageId) return [];
 
-  async touchThread(threadId) {
-    try {
-      await this.redis.set(
-        `discollama:thread:${threadId}`,
-        Date.now(),
-        "EX",
-        THREAD_IDLE_TTL
-      );
-    } catch {}
-  }
+    const ctx = await this.redis.get(
+      `discollama:message:${messageId}`
+    );
 
-  startIdleThreadWatcher() {
-    setInterval(async () => {
-      let keys = [];
-      try {
-        keys = await this.redis.keys("discollama:thread:*");
-      } catch {
-        return;
-      }
-
-      for (const key of keys) {
-        const threadId = key.split(":")[2];
-
-        try {
-          const thread = await this.client.channels.fetch(threadId);
-          if (thread?.isThread()) {
-            await thread.setArchived(true);
-          }
-          await this.redis.del(key);
-        } catch {}
-      }
-    }, 60_000);
+    return ctx ? JSON.parse(ctx) : [];
   }
 
   run(token) {
@@ -326,31 +267,30 @@ class Discollama {
   }
 }
 
+// Discord client
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent
-  ],
-  rest: { timeout: 15_000 }
+  ]
 });
 
+// Redis client
 const redis = new Redis({
   host: process.env.REDIS_HOST || "127.0.0.1",
   port: process.env.REDIS_PORT || 6379,
-  retryStrategy: times => Math.min(times * 1000, 10_000),
-  reconnectOnError: () => true,
-  maxRetriesPerRequest: null,
-  enableOfflineQueue: false
+  maxRetriesPerRequest: null
 });
 
+// Ollama client
 const ollama = new Ollama({
   host: process.env.OLLAMA_HOST || "http://127.0.0.1:11434"
 });
 
+// run bot
 new Discollama({
   client,
   ollama,
-  redis,
-  model: process.env.OLLAMA_MODEL || "llama2"
+  redis
 }).run(process.env.DISCORD_TOKEN);
