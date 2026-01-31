@@ -11,7 +11,6 @@
 
 ## Run `index.js`
 
-
 > [!NOTE]
 > You must setup a [Discord Bot](https://discord.com/developers/applications) and set the environment variable `DISCORD_TOKEN` before `index.js` can access Discord.
 
@@ -25,11 +24,9 @@ By default, it uses `127.0.0.1:11434`, which can be overwritten with `OLLAMA_HOS
 ## Customize `index.js`
 
 The default LLM is defined using `OLLAMA_MODEL`.  
-A custom personality can be added by changing the `SYSTEM` instruction in the Modelfile and running `ollama create`:
+A custom personality can be added by changing the `SYSTEM` instruction in the Modelfile and running `ollama create`.
 
-
-This can be changed in `compose.yaml`:
-
+This can be changed in `compose.yaml`.
 
 See [ollama/ollama](https://github.com/ollama/ollama/blob/main/docs/modelfile.md) for more details.
 
@@ -39,3 +36,15 @@ Discord users can interact with the bot by mentioning it in a message to start a
 or by replying to a previous response to continue an ongoing conversation.
 
 Each conversation is handled inside a dedicated thread created by the bot.
+
+---
+
+## ⚠️ Warning
+
+This repository is a **modified version** of  
+https://github.com/mxyng/discollama
+
+It has been updated, extended, and reworked to support newer features, improved stability,
+and long-running deployments.  
+The goal of this project is to keep it **open-source** and actively maintained for the
+**Ollama community**.
